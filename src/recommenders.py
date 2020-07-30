@@ -21,7 +21,7 @@ class MainRecommender:
         Матрица взаимодействий user-item
     """
     
-    def __init__(self, data, item_features, weighting=True):
+    def __init__(self, data, item_features=None, weighting=True):
         @staticmethod
         def prepare_matrix(data):
             user_item_matrix = pd.pivot_table(data,
@@ -56,12 +56,15 @@ class MainRecommender:
         @staticmethod
         def prepare_ctm(features):
             """Создаем словарь {item_id: 0/1}. 0/1 - факт принадлежности товара к СТМ"""
+            if features is None:
+                items = None
+            else:
+                own_items = features[['PRODUCT_ID', 'BRAND']]
+                own_items['priznak'] = features['BRAND'].isin(['Private'])
+                own_items = own_items.replace(to_replace=[False, True], value=[0, 1])
+                items = dict(zip(own_items['PRODUCT_ID'], own_items['priznak']))
 
-            own_items = features[['PRODUCT_ID', 'BRAND']]
-            own_items['priznak'] = features['BRAND'].isin(['Private'])
-            own_items = own_items.replace(to_replace=[False, True], value=[0, 1])
-
-            return dict(zip(own_items['PRODUCT_ID'], own_items['priznak']))
+            return items
 
         @staticmethod
         def fit_own_recommender(user_item_matrix):
@@ -83,6 +86,7 @@ class MainRecommender:
             model.fit(csr_matrix(user_item_matrix).T.tocsr())
 
             return model
+      
 
         # Топ покупок каждого юзера
         self.top_purchases = data.groupby(['user_id', 'item_id'])['quantity'].count().reset_index()
@@ -96,19 +100,20 @@ class MainRecommender:
         self.overall_top_purchases = self.overall_top_purchases.item_id.tolist()
         
         # Словарь {item_id: 0/1}. 0/1 - факт принадлежности товара к СТМ
-        self.item_id_to_ctm = prepare_ctm.__func__(item_features)
+        if item_features is None:
+            self.item_id_to_ctm = None
+        else:
+            self.item_id_to_ctm = prepare_ctm.__func__(item_features)
+            # Топ покупок каждого юзера с учётом CTM
+            self.overall_top_purchases_w_ctm = data[data['item_id'].isin([int(x) for x in self.item_id_to_ctm.keys()])].groupby('item_id')['quantity'].count().reset_index()
+            self.overall_top_purchases_w_ctm.sort_values('quantity', ascending=False, inplace=True)
+            self.overall_top_purchases_w_ctm = self.overall_top_purchases_w_ctm[self.overall_top_purchases_w_ctm['item_id'] != 999999]
+            self.overall_top_purchases_w_ctm = self.overall_top_purchases_w_ctm.item_id.tolist()
 
-        # Топ покупок каждого юзера с учётом CTM
-        self.overall_top_purchases_w_ctm = data[data['item_id'].isin([int(x) for x in self.item_id_to_ctm.keys()])].groupby('item_id')['quantity'].count().reset_index()
-        self.overall_top_purchases_w_ctm.sort_values('quantity', ascending=False, inplace=True)
-        self.overall_top_purchases_w_ctm = self.overall_top_purchases_w_ctm[self.overall_top_purchases_w_ctm['item_id'] != 999999]
-        self.overall_top_purchases_w_ctm = self.overall_top_purchases_w_ctm.item_id.tolist()
-        
         self.user_item_matrix = prepare_matrix.__func__(data)  # pd.DataFrame
         self.id_to_itemid, self.id_to_userid, self.itemid_to_id, self.userid_to_id = prepare_dicts.__func__(self.user_item_matrix)
         
-        
-        
+                
         # Own recommender обучается до взвешивания матрицы
         self.own_recommender = fit_own_recommender.__func__(self.user_item_matrix)
         
@@ -117,28 +122,76 @@ class MainRecommender:
         
         self.model = fit.__func__(self.user_item_matrix)
 
+    def _update_dict(self, user_id):
+        """Если появился новыю user / item, то нужно обновить словари"""
 
-    def get_similar_items_recommendation(self, user, filter_ctm=True, N=5):
+        if user_id not in self.userid_to_id.keys():
+
+            max_id = max(list(self.userid_to_id.values()))
+            max_id += 1
+
+            self.userid_to_id.update({user_id: max_id})
+            self.id_to_userid.update({max_id: user_id})
+    
+    def _get_similar_item(self, item_id):
+        """Находит товар, похожий на item_id"""
+        recs = self.model.similar_items(self.itemid_to_id[item_id], N=2)  # Товар похож на себя -> рекомендуем 2 товара
+        top_rec = recs[1][0]  # И берем второй (не товар из аргумента метода)
+        return self.id_to_itemid[top_rec]
+
+    def _extend_with_top_popular(self, recommendations, N=5):
+        """Если кол-во рекоммендаций < N, то дополняем их топ-популярными"""
+
+        if len(recommendations) < N:
+            recommendations.extend(self.overall_top_purchases[:N])
+            recommendations = recommendations[:N]
+
+        return recommendations
+    
+    def _get_recommendations(self, user, model, N=5):
+        """Рекомендации через стардартные библиотеки implicit"""
+
+        self._update_dict(user_id=user)
+        res = [self.id_to_itemid[rec[0]] for rec in model.recommend(userid=self.userid_to_id[user],
+                                        user_items=csr_matrix(self.user_item_matrix).tocsr(),
+                                        N=N,
+                                        filter_already_liked_items=False,
+                                        filter_items=[self.itemid_to_id[999999]],
+                                        recalculate_user=True)]
+
+        res = self._extend_with_top_popular(res, N=N)
+
+        assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
+        return res
+    
+    def get_als_recommendations(self, user, N=5):
+        """Рекомендации через стандартные библиотеки implicit"""
+
+        self._update_dict(user_id=user)
+        return self._get_recommendations(user, model=self.model, N=N)
+
+    def get_own_recommendations(self, user, N=5):
+        """Рекомендуем товары среди тех, которые юзер уже купил"""
+
+        self._update_dict(user_id=user)
+        return self._get_recommendations(user, model=self.own_recommender, N=N)
+    
+    
+    def get_similar_items_recommendation(self, user, N=5):
         """Рекомендуем товары, похожие на топ-N купленных юзером товаров"""
 
-        # your_code
-        # Практически полностью реализовали на прошлом вебинаре
-        # Не забывайте, что нужно учесть параметр filter_ctm
-        res = []
-        if filter_ctm:
-            dataset = self.overall_top_purchases_w_ctm
-        else:
-            dataset = self.overall_top_purchases
-        recommends = self.model.similar_items(self.itemid_to_id[user], N)
-        for item in recommends:
-            res.append(item[0])
+        top_users_purchases = self.top_purchases[self.top_purchases['user_id'] == user].head(N)
 
+        res = top_users_purchases['item_id'].apply(lambda x: self._get_similar_item(x)).tolist()
+        res = self._extend_with_top_popular(res, N=N)
+
+        assert len(res) == N, 'Количество рекомендаций != {}'.format(N)
         return res
 
     def get_similar_users_recommendation(self, user, N=5):
         """Рекомендуем топ-N товаров, среди купленных похожими юзерами"""
         res = []
-        recommends = self.model.similar_users(self.userid_to_id[user], N)
+        recommends = self.model.similar_users(self.id_to_userid[user], N)
         for item in recommends:
             res.append(item[0])
 
