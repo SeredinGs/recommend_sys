@@ -24,6 +24,7 @@ class MainRecommender:
     def __init__(self, data, item_features=None, weighting=True):
         @staticmethod
         def prepare_matrix(data):
+            '''sample text'''
             user_item_matrix = pd.pivot_table(data,
                                               index='user_id', columns='item_id',
                                               values='quantity',
@@ -76,8 +77,8 @@ class MainRecommender:
             return own_recommender
 
         @staticmethod
-        def fit(user_item_matrix, n_factors=20, regularization=0.001, iterations=15, num_threads=4):
-            """Обучает ALS"""
+        def fit(user_item_matrix, n_factors=30, regularization=0.01, iterations=10, num_threads=4):
+            """Обучает ALS regularization=0.001,n_factors=20 iterations=15"""
 
             model = AlternatingLeastSquares(factors=n_factors,
                                             regularization=regularization,
@@ -118,7 +119,8 @@ class MainRecommender:
         self.own_recommender = fit_own_recommender.__func__(self.user_item_matrix)
         
         if weighting:
-            self.user_item_matrix = bm25_weight(self.user_item_matrix.T).T 
+            # self.user_item_matrix = bm25_weight(self.user_item_matrix.T).T
+            self.user_item_matrix = tfidf_weight(self.user_item_matrix.T).T
         
         self.model = fit.__func__(self.user_item_matrix)
 
